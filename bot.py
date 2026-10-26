@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -11,9 +12,18 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_LOGIN = os.environ["ADMIN_LOGIN"]
-ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
+
+def env_required(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        print(f"❌ Не задана обязательная переменная окружения: {name}", file=sys.stderr)
+        sys.exit(1)
+    return value
+
+
+TOKEN = env_required("BOT_TOKEN")
+ADMIN_LOGIN = env_required("ADMIN_LOGIN")
+ADMIN_PASSWORD = env_required("ADMIN_PASSWORD")
 
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/")
 SITE_URL = os.getenv("SITE_URL", "https://example.com")
@@ -21,39 +31,21 @@ SITE_URL = os.getenv("SITE_URL", "https://example.com")
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# Временное хранение. После перезапуска бота эти данные сбросятся.
-admin_steps = {}
-admin_sessions = set()
-bound_channels = {}
+# Временное хранение (сбрасывается при перезапуске).
+admin_steps: dict[int, str] = {}
+admin_sessions: set[int] = set()
+bound_channels: dict[int, int] = {}
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text="📊 Аналитика матчей"),
-                KeyboardButton(text="🥅 Лучшие вратари"),
-            ],
-            [
-                KeyboardButton(text="🏒 Лучшие бомбардиры"),
-                KeyboardButton(text="🎯 Лучшие снайперы"),
-            ],
-            [
-                KeyboardButton(text="🔮 Шансы на победу"),
-                KeyboardButton(text="🏆 Турнирная таблица"),
-            ],
-            [
-                KeyboardButton(text="📜 Рекорды"),
-                KeyboardButton(text="🎲 Бинго"),
-            ],
-            [
-                KeyboardButton(text="🛡 Команды"),
-                KeyboardButton(text="🔎 Найти игрока"),
-            ],
-            [
-                KeyboardButton(text="📣 Telegram-канал лиги"),
-                KeyboardButton(text="🌐 Сайт лиги"),
-            ],
+            [KeyboardButton(text="📊 Аналитика матчей"), KeyboardButton(text="🥅 Лучшие вратари")],
+            [KeyboardButton(text="🏒 Лучшие бомбардиры"), KeyboardButton(text="🎯 Лучшие снайперы")],
+            [KeyboardButton(text="🔮 Шансы на победу"), KeyboardButton(text="🏆 Турнирная таблица")],
+            [KeyboardButton(text="📜 Рекорды"), KeyboardButton(text="🎲 Бинго")],
+            [KeyboardButton(text="🛡 Команды"), KeyboardButton(text="🔎 Найти игрока")],
+            [KeyboardButton(text="📣 Telegram-канал лиги"), KeyboardButton(text="🌐 Сайт лиги")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите раздел 👇",
@@ -87,14 +79,53 @@ async def start(message: Message):
 async def admin_login(message: Message):
     admin_steps[message.from_user.id] = "login"
     await message.answer(
-        "🔐 <b>Вход в панель администратора</b>\n\n"
-        "Введите логин:",
+        "🔐 <b>Вход в панель администратора</b>\n\nВведите логин:",
         parse_mode="HTML",
     )
 
 
+# ⚠️ ВАЖНО: этот хэндлер должен идти ДО общего @dp.message(F.text),
+# иначе пересланные из канала сообщения с текстом будут перехватываться меню.
+@dp.message(F.forward_from_chat)
+async def receive_forwarded_channel(message: Message):
+    user_id = message.from_user.id
+
+    if user_id not in admin_sessions:
+        return
+
+    channel = message.forward_from_chat
+    if channel is None or channel.id is None:
+        await message.answer("❌ Не удалось определить канал.")
+        return
+
+    try:
+        member = await bot.get_chat_member(channel.id, bot.id)
+
+        if member.status not in ("administrator", "creator"):
+            await message.answer(
+                "⚠️ Бот пока не администратор этого канала.\n"
+                "Добавьте его в администраторы и попробуйте ещё раз."
+            )
+            return
+
+        bound_channels[user_id] = channel.id
+        await message.answer(
+            f"✅ Канал <b>{channel.title}</b> успешно привязан!",
+            parse_mode="HTML",
+        )
+    except Exception:
+        await message.answer(
+            "❌ Не получилось проверить канал.\n"
+            "Проверьте, что бот добавлен туда администратором."
+        )
+
+
 @dp.message(F.text)
 async def handle_text(message: Message):
+    # пропускаем пересланные из каналов сообщения — их обрабатывает хэндлер выше
+    if message.forward_from_chat is not None:
+        return
+
     user_id = message.from_user.id
     text = message.text.strip()
     step = admin_steps.get(user_id)
@@ -116,24 +147,13 @@ async def handle_text(message: Message):
 
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="📣 Привязать канал",
-                            callback_data="bind_channel",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="🧹 Обнуление лиги",
-                            callback_data="reset_info",
-                        )
-                    ],
+                    [InlineKeyboardButton(text="📣 Привязать канал", callback_data="bind_channel")],
+                    [InlineKeyboardButton(text="🧹 Обнуление лиги", callback_data="reset_info")],
                 ]
             )
 
             await message.answer(
-                "✅ <b>Вы вошли в панель администратора</b>\n\n"
-                "Выберите действие:",
+                "✅ <b>Вы вошли в панель администратора</b>\n\nВыберите действие:",
                 reply_markup=keyboard,
                 parse_mode="HTML",
             )
@@ -182,37 +202,6 @@ async def bind_channel(callback):
         parse_mode="HTML",
     )
     await callback.answer()
-
-
-@dp.message(F.forward_from_chat)
-async def receive_forwarded_channel(message: Message):
-    user_id = message.from_user.id
-
-    if user_id not in admin_sessions:
-        return
-
-    channel = message.forward_from_chat
-
-    try:
-        member = await bot.get_chat_member(channel.id, bot.id)
-
-        if member.status != "administrator":
-            await message.answer(
-                "⚠️ Бот пока не администратор этого канала.\n"
-                "Добавьте его в администраторы и попробуйте ещё раз."
-            )
-            return
-
-        bound_channels[user_id] = channel.id
-        await message.answer(
-            f"✅ Канал <b>{channel.title}</b> успешно привязан!",
-            parse_mode="HTML",
-        )
-    except Exception:
-        await message.answer(
-            "❌ Не получилось проверить канал.\n"
-            "Проверьте, что бот добавлен туда администратором."
-        )
 
 
 @dp.callback_query(F.data == "reset_info")
